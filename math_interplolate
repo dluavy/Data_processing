@@ -1,0 +1,374 @@
+import pandas as pd
+import numpy as np
+
+from test_support.profile_support import profile
+from scipy.interpolate import PchipInterpolator #Piecewise Cubic Hermite Interpolating Polynomial
+
+
+@profile
+def interpolate(
+        start_df, end_df, id_cols, time_col, value_cols,
+        start_year, end_year, rank_df=None, interp_method='popgrowth'):
+    """
+    Interpolates the time period between start_df and end_df. Returns
+    a DataFrame containing all the years between start_year and
+    end_year.
+
+    Arguments:
+        start_df (DataFrame): DataFrame with starting values
+        end_df (DataFrame): DataFrame with end of period values
+        id_cols (list): List of column names which uniquely identify rows
+                in start_df and end_df
+        time_col (str): Column where the time value will be stored
+                in the output DataFrame
+        value_cols (list): List of columns with values to be interpolated
+        start_year (int): Year corresponding to start_df's values
+        end_year (int): Year corresponding to end_df's values
+        interp_method (str): Interpolation method to use... right now,
+                only 'popgrowth' is implemented:
+
+                    rate = ln(value_t1/value_t0)/(t1-t0)
+
+                Others TODO:
+                    linear, cubic?, ??
+
+    Returns:
+        A DataFrame whose value_cols contain the interpolated values
+        for the period between start_df and end_df. The returned frame
+        includes the values of start_df and end_df, re-ordered to match
+        the specified reference.
+    """
+    id_cols = list(set(id_cols) - set([time_col]))
+    if rank_df is None:
+        rank_df = end_df.copy()
+    assert (start_df[id_cols + value_cols].shape ==
+            end_df[id_cols + value_cols].shape ==
+            rank_df[id_cols + value_cols].shape), """
+            start_df, end_df, and rank_df must be the same shape """
+
+    start_df = start_df.sort_values(by=id_cols)
+    end_df = end_df.sort_values(by=id_cols)
+    rank_df = rank_df.sort_values(by=id_cols)
+    assert ((start_df[id_cols] == end_df[id_cols]) &
+            (start_df[id_cols] == rank_df[id_cols])).all().all(), """
+            id_cols in start_df, end_df, and rank_df must be alignable"""
+    start_mat = start_df[value_cols].values
+    end_mat = end_df[value_cols].values
+    rank_mat = rank_df[value_cols].values
+
+    # Re-order draws based on the rank (reference) df
+    ranks = np.argsort(rank_mat, axis=1)
+    rank_order = np.argsort(ranks, axis=1)
+    nrows, ncols = rank_mat.shape
+    rows = np.tile(np.array(range(nrows)), (ncols, 1)).T
+    start_mat.sort(axis=1)
+    #revert back to original order
+    start_mat = start_mat[rows, rank_order]
+    end_mat.sort(axis=1)
+    end_mat = end_mat[rows, rank_order]
+
+    t_df = start_df.sort_values(by=id_cols)
+    t_df = t_df.reset_index(drop=True)
+    t_df = t_df.drop(value_cols, axis=1)
+
+    # Interpolate
+    tspan = end_year - start_year
+    if interp_method == 'popgrowth':
+        start_mat[start_mat == 0] = 1e-12
+        end_mat[end_mat == 0] = 1e-12
+        r_mat = np.log(end_mat / start_mat) / tspan
+    else:
+        r_mat = np.log(end_mat / start_mat) / tspan
+
+    interp_df = []
+    for t in range(0, tspan + 1):
+        t_df = start_df.sort_values(by=id_cols)
+        t_df = t_df.reset_index(drop=True)
+        t_df = t_df.drop(value_cols, axis=1)
+        join_df = pd.DataFrame(
+            start_mat * np.exp(r_mat * t),
+            index=t_df.index,
+            columns=value_cols)
+        t_df = t_df.join(join_df)
+        t_df[time_col] = start_year + t
+        interp_df.append(t_df)
+    interp_df = pd.concat(interp_df)
+    interp_df = interp_df.reset_index(drop=True)
+    return interp_df
+
+
+def pchip_interpolate(df, id_cols, value_cols, time_col="year_id",
+                      time_vals=None):
+    """
+    Interpolates using scipy's pchip cubic spline interpolation algorithm
+    for all time values contained in the time_vals argument.
+    Returns a DataFrame containing interpolated estimates for all demographic
+    contained in the df argument, for only those time values found in
+    time_vals, and *NOT* found in the original dataframe.
+
+    Note: the interpolated values returned depend on the number of
+        time-value points passed in.  For example, if df includes
+        data for 1990, 1995, and 2000 and df1 contains data for
+        1990, 1995, 2000, and 2005 the interpolated values returned by
+        pchip_interpolate(df, ...) will be the same as those returned by
+        pchip_interpolate(df1, ...) for years between 1990 and 1995, but
+        for years between 1995 and 2000 they will be different because
+        pchip is getting extra information about what the slope of a given
+        line should be at year 2000.  It is recommended, therefore, that the
+        dataframe passed in contain data for all estimation years,
+        even if you are only trying to generate estimates for a narrow
+        range of years.
+
+    Note 2: this function sorts and uses a weighted average algoritm
+        on the 'value_cols' and is thus only suitable for use
+        on data organized into draws (re: model runs), and not suitable
+        for a single value column or value columns which do not represent
+        individual runs of the same model. If, for example, the value_cols
+        contain a column which is the mean for some prevalence draws, a column
+        of populations, and a column of death draws, the results will be BAD.
+        If you are interested in interpolating means, or populations, or
+        something other than draws using the piecewise cubic hermite
+        interpolating polynomial algorithm, check out the
+        scipy.interpolate.PchipInterpolater class.
+
+    Examples:
+        out = pchip_interpolate(
+            df,
+            ['measure_id', 'modelable_entity_id',
+             'location_id', 'sex_id', 'age_group_id'],
+            ['draw_{}'.format(x) for x in range(1000)],
+            time_vals=[1993, 1996, 1998, 2001])
+        The returned dataframe 'out' will contain interpolated values
+        for 1000 draws calculated for every location, sex, measure, age_group,
+        and modelable_entity in df, but only for years 1993, 1996, 1998, 2001
+
+        out = pchip_interpolate(
+            df,
+            ['measure_id', 'modelable_entity_id',
+             'location_id', 'sex_id', 'age_group_id'],
+            ['draw_{}'.format(x) for x in range(1000)])
+        Since the default (None) value was passed for time_vals argument,
+        if df contained data for years 1990, 1995, 2000, and 2005 the output
+        dataframe will contain estimates for the years:
+        1991, 1992, 1993, 1994, 1996, 1997, 1998, 1999, 2001,
+        2002, 2003, and 2004
+
+    Arguments:
+        df (DataFrame): DataFrame with time values which form the basis
+            for the interpolation
+        id_cols (list(str)): List of column names which uniquely identify
+            groups of rows that form a single time series.  Essentially any
+            column which does which is not included in value_cols, and is not
+            time_col
+        time_col (str): Column containing the time (independent) variable
+        value_cols (list(str)): List of column names with values to be
+            interpolated (dependent variable)
+        time_vals (list(int)): List of values corresponding
+            to time values which will be returned in the output dataframe.
+            Any values passed to time_vals which are present in the input
+            df's time_col will be ignored and excluded from the output
+            dataframe. Default None, will return all times between the min
+            and max values for time_col in the input dataframe, excluding
+            those times actually present in the input dataframe.
+
+    Returns:
+        A DataFrame whose value_cols contain the interpolated values
+        for the time values in time_vals. The returned frame
+        will not include the rows from the input dataframe.
+    """
+    id_cols = list(np.atleast_1d(id_cols))
+    value_cols = list(np.atleast_1d(value_cols))
+    group_cols = [col for col in id_cols if col != time_col]
+    if time_vals is None:
+        try:
+            time_vals = list(range(
+                min(df[time_col].unique().tolist()),
+                max(df[time_col].unique().tolist())))
+        except TypeError:
+            raise ValueError("Values in the 'time_col' of the input DataFrame "
+                             "must be integers.")
+    else:
+        time_vals = list(np.atleast_1d(time_vals))
+    df_list = []
+    for idx, sub_df in df.groupby(group_cols):
+        sub_df = sub_df.sort_values(time_col)
+        input_draw_mat = sub_df[value_cols].values
+        input_draw_rank_sort = input_draw_mat.argsort().argsort()
+        input_draw_mat.sort(axis=1)
+        time_arr = sub_df[time_col].values
+        interp_time_vals = [val for val in time_vals if val not in time_arr]
+
+        if interp_time_vals:
+            interp = PchipInterpolator(time_arr, input_draw_mat)
+            interp_draw_mat = interp(interp_time_vals)
+
+            # use a weighted average to impose time correlation from
+            # the values of two years bracketing the estimate(s)
+            corr_draw_arr_list = []
+            for time_val, draw_arr in zip(interp_time_vals, interp_draw_mat):
+                draw_arr = np.squeeze(np.asarray(draw_arr))
+                before = max(time_arr[(time_arr < time_val)])
+                after = min(time_arr[(time_arr > time_val)])
+                before_weight = float(after - time_val) / (after - before)
+                after_weight = 1 - before_weight
+                before_corr_bool = (time_arr == before)
+                after_corr_bool = (time_arr == after)
+                before_corr_vec = input_draw_rank_sort[before_corr_bool]
+                after_corr_vec = input_draw_rank_sort[after_corr_bool]
+                before_corr_vec = np.squeeze(np.asarray(before_corr_vec))
+                after_corr_vec = np.squeeze(np.asarray(after_corr_vec))
+                before_corr_draw_arr = draw_arr[before_corr_vec]
+                after_corr_draw_arr = draw_arr[after_corr_vec]
+                corr_draw_arr = (
+                    (before_corr_draw_arr * before_weight) +
+                    (after_corr_draw_arr * after_weight))
+                corr_draw_arr_list.append(corr_draw_arr)
+
+            # add index
+            corr_interp_df = pd.DataFrame(corr_draw_arr_list)
+            corr_interp_df.index = pd.Index(interp_time_vals, name=time_col)
+            corr_interp_df = corr_interp_df.reset_index()
+            for level, name in zip(idx, group_cols):
+                corr_interp_df[name] = level
+
+            df_list.append(corr_interp_df)
+
+    if df_list:
+        df = pd.concat(df_list)
+        df = df.set_index(group_cols + [time_col])
+        df.columns = value_cols
+        df = df.reset_index()
+    else:
+        df = pd.DataFrame()
+
+    return df
+
+
+def linear_interpolate(df, id_cols, value_cols,
+                       time_col="year_id", time_vals=None):
+
+    """
+    Interpolates using a simple linear interpolation algorithm
+    for all time values contained in the time_vals argument.
+    Returns a DataFrame containing interpolated estimates for all demographic
+    contained in the df argument, for only those time values found in
+    time_vals, and *NOT* found in the original dataframe.
+
+    *NOTE: slow, not optimized for speed. Included for testing / comparison
+    against pchip_interpolate, not necessarily to be used in production.
+
+    Examples:
+        out = linear_interpolate(
+            df,
+            ['measure_id', 'modelable_entity_id',
+             'location_id', 'sex_id', 'age_group_id'],
+            ['draw_{}'.format(x) for x in range(1000)],
+            time_vals=[1993, 1996, 1998, 2001])
+        The returned dataframe 'out' will contain interpolated values for
+        1000 draws calculated for every location, sex, measure, age_group,
+        and modelable_entity in df, but only for years 1993, 1996, 1998, 2001
+
+        out = linear_interpolate(
+            df,
+            ['measure_id', 'modelable_entity_id',
+             'location_id', 'sex_id', 'age_group_id'],
+            ['draw_{}'.format(x) for x in range(1000)])
+        Since the default (None) value was passed for time_vals argument,
+        if df contained data for years 1990, 1995, 2000, and 2005 the output
+        dataframe will contain estimates for the years:
+        1991, 1992, 1993, 1994, 1996, 1997, 1998, 1999, 2001,
+        2002, 2003, and 2004
+
+    Arguments:
+        df (DataFrame): DataFrame with time values which form the basis
+            for the interpolation
+        id_cols (list(str)): List of column names which uniquely identify
+            groups of rows that form a single time series.  Essentially any
+            column which does which is not included in value_cols, and is not
+            time_col
+        time_col (str): Column containing the time (independent) variable
+        value_cols (list(str)): List of column names with values to be
+            interpolated (dependent variable)
+        time_vals (list(int)): List of values corresponding
+            to time values which will be returned in the output dataframe.
+            Any values passed to time_vals which are present in the input
+            df's time_col will be ignored and excluded from the output
+            dataframe. Default None, will return all times between the min
+            and max values for time_col in the input dataframe, excluding
+            those times actually present in the input dataframe.
+
+    Returns:
+        A DataFrame whose value_cols contain the interpolated values
+        for the time values in time_vals. The returned frame
+        will not include the rows from the input dataframe.
+    """
+    group_cols = [col for col in id_cols if col != time_col]
+    if time_vals is None:
+        time_vals = list(range(
+            min(df[time_col].unique().tolist()),
+            max(df[time_col].unique().tolist())))
+    df_list = []
+    for idx, sub_df in df.groupby(group_cols):
+        draw_arr_list = []
+        time_arr = sub_df[time_col].values
+        interp_time_vals = [val for val in time_vals if val not in time_arr]
+        input_draw_rank_sort = sub_df[value_cols].values.argsort().argsort()
+
+        for time in interp_time_vals:
+            before = min([time - t for t in time_arr if t < time])
+            after = min([t - time for t in time_arr if t > time])
+            start_mat = sub_df.loc[
+                sub_df[time_col] == (time - before)][value_cols].values
+            end_mat = sub_df.loc[
+                sub_df[time_col] == (time + after)][value_cols].values
+
+            for arr in [start_mat, end_mat]:
+                arr.sort(axis=1)
+
+            interp_mat = (
+                ((start_mat * after) + (end_mat * before)) /
+                (before + after)).flatten()
+            draw_arr_list.append(interp_mat)
+
+        # use a weighted average to impose time correlation from
+        # the values of two years bracketing the estimate(s)
+        if interp_time_vals:
+            corr_draw_arr_list = []
+            interp_draw_mat = np.matrix(draw_arr_list)
+            for time_val, draw_arr in zip(interp_time_vals, interp_draw_mat):
+                draw_arr = np.squeeze(np.asarray(draw_arr))
+                before = max(time_arr[(time_arr < time_val)])
+                after = min(time_arr[(time_arr > time_val)])
+                before_weight = float(after - time_val) / (after - before)
+                after_weight = 1 - before_weight
+                before_corr_bool = (time_arr == before)
+                after_corr_bool = (time_arr == after)
+                before_corr_vec = input_draw_rank_sort[before_corr_bool]
+                after_corr_vec = input_draw_rank_sort[after_corr_bool]
+                before_corr_vec = np.squeeze(np.asarray(before_corr_vec))
+                after_corr_vec = np.squeeze(np.asarray(after_corr_vec))
+                before_corr_draw_arr = draw_arr[before_corr_vec]
+                after_corr_draw_arr = draw_arr[after_corr_vec]
+                corr_draw_arr = (
+                    (before_corr_draw_arr * before_weight) +
+                    (after_corr_draw_arr * after_weight))
+                corr_draw_arr_list.append(corr_draw_arr)
+
+            # add index
+            corr_interp_df = pd.DataFrame(corr_draw_arr_list)
+            corr_interp_df.index = pd.Index(interp_time_vals, name=time_col)
+            corr_interp_df = corr_interp_df.reset_index()
+            for level, name in zip(idx, group_cols):
+                corr_interp_df[name] = level
+
+            df_list.append(corr_interp_df)
+
+    if df_list:
+        df = pd.concat(df_list)
+        df = df.set_index(group_cols + [time_col])
+        df.columns = value_cols
+        df = df.reset_index()
+    else:
+        df = pd.DataFrame()
+
+    return df
